@@ -1,0 +1,4 @@
+compose-addition.yaml
+__pycache__/
+*.pyc
+.env
