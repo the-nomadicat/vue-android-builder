@@ -225,10 +225,13 @@ APK_SEARCH_PATHS = [
 ]
 
 
-def _find_apk(project_path: str) -> Optional[str]:
+def _find_apk(project_path: str, min_mtime: float = 0.0) -> Optional[str]:
+    """Find a freshly built APK. If min_mtime is set, only return APKs modified after that time."""
     for rel in APK_SEARCH_PATHS:
         candidate = os.path.join(project_path, rel)
         if os.path.isfile(candidate):
+            if min_mtime and os.path.getmtime(candidate) < min_mtime:
+                continue  # Stale APK from a previous build — ignore
             return candidate
     return None
 
@@ -289,7 +292,8 @@ def _rotate_logs(project_name: str):
 def _build_project(project_info: dict, active_build: ActiveBuild) -> tuple:
     """
     Run the build for one project.
-    Returns (success: bool, error_msg: str, apk_path: Optional[str]).
+    Returns (success: bool, error_msg: str, apk_path: Optional[str], script_delivered: bool).
+    script_delivered=True means the build script copied the APK itself (exit 0 + Dropbox).
     """
     path = project_info["path"]
     name = project_info["name"]
@@ -311,6 +315,7 @@ def _build_project(project_info: dict, active_build: ActiveBuild) -> tuple:
 
     log_path = active_build.log_path
     last_lines: list = []
+    build_start_time = time.time()
 
     try:
         os.makedirs("/tmp/apk-output", exist_ok=True)
@@ -360,16 +365,26 @@ def _build_project(project_info: dict, active_build: ActiveBuild) -> tuple:
             log_f.write(f"\n=== BUILD END: exit code {exit_code} ===\n")
 
     except Exception as e:
-        return False, str(e), None
+        return False, str(e), None, False
 
-    # Check if APK was produced (may have been built even if copy step failed)
-    apk_path = _find_apk(path)
+    error_tail = "\n".join(last_lines[-30:])
 
-    if apk_path:
-        return True, "", apk_path
+    if exit_code == 0:
+        # Build script succeeded — it handled Dropbox delivery itself.
+        # Look for the APK to record its size (not for delivery).
+        apk_path = _find_apk(path, min_mtime=build_start_time - 60)
+        if apk_path:
+            return True, "", apk_path, True  # script_delivered=True
+        else:
+            msg = f"Build exited 0 but no fresh APK found at expected paths.\n{error_tail}"
+            return False, msg, None, False
     else:
-        error_tail = "\n".join(last_lines[-30:])
-        return False, f"Exit code {exit_code}. No APK found.\n{error_tail}", None
+        # Build script failed. Gradle may have cached/restored an APK — do NOT treat as success.
+        # Report as failed with the error. APK path is noted for diagnostics only.
+        stale_apk = _find_apk(path, min_mtime=build_start_time - 60)
+        stale_note = f"\nAPK cache exists at: {stale_apk}" if stale_apk else ""
+        msg = f"Exit code {exit_code}. Build script failed.{stale_note}\n{error_tail}"
+        return False, msg, None, False
 
 
 # ── Batch orchestration ─────────────────────────────────────────────────────
@@ -392,7 +407,7 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
                 state.active.append(active)
 
             start = time.time()
-            success, error, apk_path = _build_project(project_info, active)
+            success, error, apk_path, script_delivered = _build_project(project_info, active)
             duration = time.time() - start
 
             taildrive_url = ""
@@ -408,15 +423,21 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
 
                 apk_size_mb = round(os.path.getsize(apk_path) / 1024 / 1024, 2)
 
-                # Upload to TailDrive
-                ok, result = _upload_to_taildrive(apk_path, product_name, version)
-                with open(log_path, "a", encoding="utf-8") as lf:
-                    if ok:
-                        taildrive_url = result
-                        lf.write(f"\n=== APK delivered to TailDrive: {result} ===\n")
-                    else:
-                        lf.write(f"\n=== TailDrive upload failed: {result} ===\n")
-                        lf.write(f"=== APK available locally: {apk_path} ===\n")
+                if script_delivered:
+                    # Script handled delivery to Dropbox — no extra upload needed
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        lf.write(f"\n=== APK delivered by build script (Dropbox) ===\n")
+                        taildrive_url = "dropbox"
+                else:
+                    # Script failed at copy step — deliver via TailDrive
+                    ok, result = _upload_to_taildrive(apk_path, product_name, version)
+                    with open(log_path, "a", encoding="utf-8") as lf:
+                        if ok:
+                            taildrive_url = result
+                            lf.write(f"\n=== APK delivered to TailDrive: {result} ===\n")
+                        else:
+                            lf.write(f"\n=== TailDrive upload failed: {result} ===\n")
+                            lf.write(f"=== APK available at: {apk_path} ===\n")
 
                 with state._lock:
                     state.active = [a for a in state.active if a.project != name]
