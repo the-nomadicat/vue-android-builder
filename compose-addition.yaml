@@ -1,0 +1,28 @@
+
+  android-builder:
+    build:
+      context: ./android-builder
+    image: android-builder:latest
+    container_name: android-builder
+    network_mode: service:tailscale
+    environment:
+      - PROJECTS_ROOT=/mount/vue
+      - LOGS_DIR=/mount/logs
+      - ANDROID_HOME=/mount/android-sdk
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+      - TAILDRIVE_URL=http://100.100.100.100:8080/atkins.email@gmail.com/zephyrusg16/dropboxapps
+      - PORT=8083
+    volumes:
+      - ${VUE_PROJECTS_PATH:-C:/vue.js}:/mount/vue
+      - android-sdk:/mount/android-sdk
+      - android-builder-logs:/mount/logs
+      - android-gradle:/root/.gradle
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    restart: always
+
+volumes:
+  android-sdk:
+  android-builder-logs:
+  android-gradle:
