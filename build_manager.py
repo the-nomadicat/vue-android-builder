@@ -75,7 +75,7 @@ class BuildState:
         self.running = False
         self.job_id: Optional[str] = None
         self.started_at: Optional[float] = None
-        self.max_parallel: int = 1
+        self.max_parallel: int = int(os.environ.get("MAX_PARALLEL", 3))
         self.queue: list = []
         self.active: list = []
         self.completed: list = []
