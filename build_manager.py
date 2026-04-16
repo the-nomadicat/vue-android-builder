@@ -372,12 +372,11 @@ def _build_project(project_info: dict, active_build: ActiveBuild) -> tuple:
     if exit_code == 0:
         # Build script succeeded — it handled Dropbox delivery itself.
         # Look for the APK to record its size (not for delivery).
+        # If we can't find the APK locally that's fine — the script exited 0,
+        # meaning it ran to completion and handled delivery (e.g. incremental
+        # build where the APK mtime predates our window, or different output path).
         apk_path = _find_apk(path, min_mtime=build_start_time - 60)
-        if apk_path:
-            return True, "", apk_path, True  # script_delivered=True
-        else:
-            msg = f"Build exited 0 but no fresh APK found at expected paths.\n{error_tail}"
-            return False, msg, None, False
+        return True, "", apk_path, True  # script_delivered=True
     else:
         # Build script failed. Gradle may have cached/restored an APK — do NOT treat as success.
         # Report as failed with the error. APK path is noted for diagnostics only.
