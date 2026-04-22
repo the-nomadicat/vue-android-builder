@@ -2,3 +2,8 @@ compose-addition.yaml
 __pycache__/
 *.pyc
 .env
+_patch_*
+fix-*.py
+fix-*.ps1
+test_*.py
+compose_*_backup.yaml

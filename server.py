@@ -127,8 +127,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         path, _ = self._parse_path()
 
-        # POST /build
-        if path == "/build":
+        # POST /build  or  POST /build/<project>
+        if path == "/build" or path.startswith("/build/"):
+            # URL-based single-project shortcut: POST /build/<project>
+            # Avoids SSH/shell quoting issues with JSON bodies entirely.
+            url_project = path[len("/build/"):] if path.startswith("/build/") else None
+
             try:
                 body = self._read_body()
                 params = json.loads(body) if body else {}
@@ -141,17 +145,20 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # Parse projects parameter
-            raw_projects = params.get("projects")
-            if raw_projects == "all" or raw_projects is None:
-                project_names = None
-            elif isinstance(raw_projects, str):
-                project_names = [raw_projects]
-            elif isinstance(raw_projects, list):
-                project_names = raw_projects
+            # URL project takes priority; fall back to body params
+            if url_project:
+                project_names = [url_project]
             else:
-                self._send_json(400, {"error": "projects must be 'all', a string, or a list"})
-                return
+                raw_projects = params.get("projects")
+                if raw_projects == "all" or raw_projects is None:
+                    project_names = None
+                elif isinstance(raw_projects, str):
+                    project_names = [raw_projects]
+                elif isinstance(raw_projects, list):
+                    project_names = raw_projects
+                else:
+                    self._send_json(400, {"error": "projects must be 'all', a string, or a list"})
+                    return
 
             max_parallel = int(params.get("parallel", 3))
             if max_parallel < 1:
@@ -166,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
                     "job_id": result,
                     "message": "Build started. Poll GET /status every 30s for progress.",
                     "parallel": max_parallel,
+                    "projects": project_names or "all",
                 })
             else:
                 self._send_json(409, {"error": result})

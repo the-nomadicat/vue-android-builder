@@ -33,6 +33,9 @@ ANDROID_HOME = os.environ.get("ANDROID_HOME", "/mount/android-sdk")
 JAVA_HOME = os.environ.get("JAVA_HOME", "/usr/lib/jvm/java-17-openjdk-amd64")
 MAX_LOGS_PER_PROJECT = 10
 
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "C0AN3EAU8AE")
+
 # Regex patterns for stage progress
 STAGE_RE = re.compile(r"===\s*\[(\d+)/(\d+)\]\s+(.+?)\s*===")
 STAGE_ARROW_RE = re.compile(r"^==>\s+(.+)$")
@@ -236,6 +239,20 @@ def _find_apk(project_path: str, min_mtime: float = 0.0) -> Optional[str]:
     return None
 
 
+def _copy_to_project_apks_dir(apk_path: str, project_path: str, product_name: str, version: str) -> tuple:
+    """Copy APK to <project_path>/APKs/<ProductName> <version>.apk. Returns (success, path_or_error)."""
+    import shutil
+    dest_dir = os.path.join(project_path, "APKs")
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = f"{product_name} {version}.apk"
+    dest_path = os.path.join(dest_dir, filename)
+    try:
+        shutil.copy2(apk_path, dest_path)
+        return True, dest_path
+    except Exception as e:
+        return False, str(e)
+
+
 def _upload_to_taildrive(apk_path: str, product_name: str, version: str) -> tuple:
     """
     Upload APK to TailDrive via WebDAV PUT.
@@ -269,6 +286,25 @@ def _upload_to_taildrive(apk_path: str, product_name: str, version: str) -> tupl
 
     except Exception as e:
         return False, str(e)
+
+
+# ── Slack notifications ─────────────────────────────────────────────────────
+def _notify_slack(text: str):
+    """Post a plain-text message to Slack. Silently no-ops if token is unset."""
+    if not SLACK_BOT_TOKEN:
+        return
+    try:
+        payload = json.dumps({"channel": SLACK_CHANNEL, "text": text}).encode()
+        req = urllib.request.Request(
+            "https://slack.com/api/chat.postMessage",
+            data=payload,
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {SLACK_BOT_TOKEN}")
+        urllib.request.urlopen(req, timeout=15)
+    except Exception:
+        pass  # Never let a notification failure break the build
 
 
 # ── Log management ─────────────────────────────────────────────────────────
@@ -410,7 +446,7 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
             duration = time.time() - start
 
             taildrive_url = ""
-            if success and apk_path:
+            if success:
                 version = project_info.get("version", "0.0.0")
                 # Re-read version in case it was bumped during build
                 try:
@@ -420,23 +456,42 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
                 except Exception:
                     pass
 
-                apk_size_mb = round(os.path.getsize(apk_path) / 1024 / 1024, 2)
+                # If local APK not found in project tree, search Dropbox mount for recently-written APK
+                # (temp-dir builds copy to Dropbox using a folder name that may differ from productName)
+                if not apk_path:
+                    dropbox_root = "/mnt/c/Users/conta/Dropbox/Apps"
+                    cutoff = start - 120  # built within last 2 min
+                    candidates = glob.glob(os.path.join(dropbox_root, "**", "*.apk"), recursive=True)
+                    recent = [f for f in candidates if os.path.getmtime(f) >= cutoff]
+                    if recent:
+                        apk_path = max(recent, key=os.path.getmtime)
 
-                if script_delivered:
-                    # Script handled delivery to Dropbox — no extra upload needed
+                apk_size_mb = round(os.path.getsize(apk_path) / 1024 / 1024, 2) if apk_path else 0.0
+
+                # Primary: ensure APK is in project's APKs/ folder.
+                # The build script handles this itself (linux-android-debug.mjs),
+                # but we also do it here as a safety net for scripts that don't.
+                if apk_path:
+                    proj_ok, proj_result = _copy_to_project_apks_dir(
+                        apk_path, project_info["path"], product_name, version
+                    )
                     with open(log_path, "a", encoding="utf-8") as lf:
-                        lf.write(f"\n=== APK delivered by build script (Dropbox) ===\n")
-                        taildrive_url = "dropbox"
-                else:
-                    # Script failed at copy step — deliver via TailDrive
+                        if proj_ok:
+                            lf.write(f"=== APK saved to project APKs/: {proj_result} ===\n")
+                            taildrive_url = "project_apks"
+                        else:
+                            lf.write(f"=== APK project copy failed: {proj_result} ===\n")
+
+                # Optional: try TailDrive upload if APK found locally.
+                # Never fails the build — just logs the outcome.
+                if apk_path and not script_delivered:
                     ok, result = _upload_to_taildrive(apk_path, product_name, version)
                     with open(log_path, "a", encoding="utf-8") as lf:
                         if ok:
                             taildrive_url = result
-                            lf.write(f"\n=== APK delivered to TailDrive: {result} ===\n")
+                            lf.write(f"=== APK uploaded to TailDrive: {result} ===\n")
                         else:
-                            lf.write(f"\n=== TailDrive upload failed: {result} ===\n")
-                            lf.write(f"=== APK available at: {apk_path} ===\n")
+                            lf.write(f"=== TailDrive not available (skipped): {result} ===\n")
 
                 with state._lock:
                     state.active = [a for a in state.active if a.project != name]
@@ -448,6 +503,11 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
                         log_path=log_path,
                         taildrive_url=taildrive_url,
                     ))
+                mins, secs = divmod(int(duration), 60)
+                _notify_slack(
+                    f":white_check_mark: *{product_name}* v{version} built in {mins}m {secs}s"
+                    + (f" · {apk_size_mb} MB" if apk_size_mb else "")
+                )
             else:
                 with state._lock:
                     state.active = [a for a in state.active if a.project != name]
@@ -459,6 +519,11 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
                         duration_s=duration,
                         log_path=log_path,
                     ))
+                mins, secs = divmod(int(duration), 60)
+                _notify_slack(
+                    f":x: *{product_name}* failed at stage {active.stage} ({active.stage_name})"
+                    f" after {mins}m {secs}s"
+                )
 
     for p in projects_to_build:
         t = threading.Thread(target=build_one, args=(p,), daemon=True)
@@ -470,6 +535,17 @@ def _run_batch(projects_to_build: list, max_parallel: int, job_id: str):
 
     with state._lock:
         state.running = False
+        n_ok = len(state.completed)
+        n_fail = len(state.failed)
+        total = n_ok + n_fail
+
+    if total > 1:
+        # Only send a summary for multi-project batches (single-project already got its own msg)
+        parts = [f":package: *Android batch complete* — {n_ok}/{total} succeeded"]
+        if n_fail:
+            failed_names = ", ".join(b.project for b in state.failed)
+            parts.append(f":x: Failed: {failed_names}")
+        _notify_slack("\n".join(parts))
 
 
 def start_batch(project_names=None, max_parallel: int = 3) -> tuple:
@@ -515,6 +591,12 @@ def start_batch(project_names=None, max_parallel: int = 3) -> tuple:
         daemon=True,
     )
     t.start()
+
+    names = [p["name"] for p in projects_to_build]
+    if len(names) == 1:
+        _notify_slack(f":hammer: Building *{projects_to_build[0].get('product_name', names[0])}*…")
+    else:
+        _notify_slack(f":hammer: Android batch started — {len(names)} projects, {max_parallel} parallel (job `{job_id}`)")
 
     return True, job_id
 
